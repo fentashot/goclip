@@ -52,13 +52,46 @@ func detectClipboardCmd() (string, []string, bool) {
 }
 
 // writeUsingCmd pipes content to an external clipboard helper.
+// wl-copy acts as a clipboard server and never exits on its own — passing
+// --paste-once makes it exit immediately after the first paste request is
+// served (or right after the data is offered), which prevents goclip from
+// hanging indefinitely.
 func writeUsingCmd(bin string, args []string, content string) error {
+	// wl-copy without any flag forks into the background and never exits,
+	// so cmd.Wait() would block forever. --paste-once (-o) tells wl-copy to
+	// exit as soon as the clipboard content has been served once, which is
+	// the correct one-shot behaviour for a pipe tool.
+	if strings.HasSuffix(bin, "wl-copy") {
+		args = append([]string{"--paste-once"}, args...)
+	}
+
 	cmd := exec.Command(bin, args...)
-	cmd.Stdin = strings.NewReader(content)
 	cmd.Env = os.Environ()
-	out, err := cmd.CombinedOutput()
+
+	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return fmt.Errorf("%s failed: %v (%s)", bin, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%s: stdin pipe: %w", bin, err)
+	}
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("%s: start: %w", bin, err)
+	}
+
+	if _, err := io.WriteString(stdin, content); err != nil {
+		_ = cmd.Process.Kill()
+		return fmt.Errorf("%s: write stdin: %w", bin, err)
+	}
+	// Close stdin so the helper knows input is done.
+	if err := stdin.Close(); err != nil {
+		_ = cmd.Process.Kill()
+		return fmt.Errorf("%s: close stdin: %w", bin, err)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("%s failed: %v (%s)", bin, err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
 }
